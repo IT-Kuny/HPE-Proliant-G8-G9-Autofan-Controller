@@ -1,0 +1,17 @@
+[Unit]
+Description=Thermal Fan Controller for HP DL360p Gen8
+After=network.target
+Wants=lm-sensors.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/fan-controller/fan-controller.py -c /etc/fan-controller/config.yaml
+Restart=always
+RestartSec=10
+EnvironmentFile=-/etc/fan-controller/env
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fan-controller
+
+[Install]
+WantedBy=multi-user.target
