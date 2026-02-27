@@ -6,7 +6,7 @@ Standalone thermal fan controller for HP DL360p Gen8 with modded iLO4 firmware.
 - Per-sensor fan curves (each sensor has its own temperature-to-fan mapping)
 - Hybrid sensor reading: `lm-sensors` for CPU temps, `ipmitool sdr` for BMC sensors
 - Fan control via SSH to iLO4 (`fan p <n> lock <speed>`)
-- Outdoor temperature integration (Open-Meteo API, Basel)
+- Outdoor temperature integration (Open-Meteo API)
 - Adaptive cooling detection (correlates inlet vs outdoor temp to detect AC/open window)
 - Proactive boost when ambient OR critical sensors elevated
 - Cooling discount when active cooling detected
