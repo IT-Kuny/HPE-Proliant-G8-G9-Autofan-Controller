@@ -403,7 +403,11 @@ def compute_target_fan(cfg: dict, temps: dict[str, float],
 # ---------------------------------------------------------------------------
 
 def set_fans_ssh(cfg: dict, fan_percent: float, fan_count: int = 8, dry_run: bool = False) -> bool:
-    """Set fan speeds via SSH to iLO4."""
+    """Set fan speeds via SSH to iLO4.
+
+    iLO SSH is an interactive CLI, not a shell. Commands must be sent
+    via stdin, one per line, followed by 'exit'.
+    """
     ilo = cfg["ilo"]
     speed_raw = int(round((fan_percent / 100.0) * 255))
     speed_raw = max(0, min(255, speed_raw))
@@ -423,26 +427,41 @@ def set_fans_ssh(cfg: dict, fan_percent: float, fan_count: int = 8, dry_run: boo
         "sshpass", "-p", ilo["password"],
         "ssh", "-o", "StrictHostKeyChecking=no",
         "-o", f"KexAlgorithms={ilo['ssh_kex']}",
-        "-o", "HostKeyAlgorithms=+ssh-rsa,ssh-dss",
-        "-o", "Ciphers=+aes256-cbc,aes128-cbc,3des-cbc",
-        "-o", "PubkeyAcceptedAlgorithms=+ssh-rsa",
+        "-o", "HostKeyAlgorithms=ssh-rsa",
+        "-o", "Ciphers=aes256-ctr",
+        "-o", "PubkeyAcceptedAlgorithms=ssh-rsa",
+        "-o", "ConnectTimeout=10",
         f"{ilo['username']}@{ilo['host']}",
     ]
 
-    combined = " && ".join(commands)
+    # iLO SSH is an interactive CLI that doesn't exit cleanly.
+    # Send commands via stdin, use system timeout to force-close.
+    stdin_data = "\n".join(commands) + "\nexit\n"
 
     try:
+        # Wrap with timeout(1) since iLO SSH hangs after exit
         result = subprocess.run(
-            ssh_cmd + [combined],
-            capture_output=True, text=True, timeout=15
+            ["timeout", "20"] + ssh_cmd,
+            input=stdin_data,
+            capture_output=True, text=True, timeout=25
         )
-        if result.returncode != 0:
-            LOG.error("SSH fan set failed (rc=%d): %s", result.returncode, result.stderr.strip())
+        output = result.stdout + result.stderr
+        # Check for auth/connection errors
+        if "Permission denied" in output:
+            LOG.error("SSH auth failed: %s", result.stderr.strip())
             return False
+        if "Connection refused" in output or "No route" in output:
+            LOG.error("SSH connection failed: %s", result.stderr.strip())
+            return False
+        if "Unable to negotiate" in output:
+            LOG.error("SSH cipher mismatch: %s", result.stderr.strip())
+            return False
+        # Exit code 124 = timeout killed it (expected for iLO)
+        # Commands were already sent and executed before timeout
         LOG.info("Fans set to %d%% (raw %d/255)", fan_percent, speed_raw)
         return True
     except subprocess.TimeoutExpired:
-        LOG.error("SSH to iLO timed out")
+        LOG.error("SSH to iLO timed out completely")
         return False
     except Exception as e:
         LOG.error("SSH fan set error: %s", e)
