@@ -402,7 +402,115 @@ def compute_target_fan(cfg: dict, temps: dict[str, float],
 # Fan control via SSH to iLO
 # ---------------------------------------------------------------------------
 
-def set_fans_ssh(cfg: dict, fan_percent: float, fan_count: int = 8, dry_run: bool = False) -> bool:
+
+class IloSshSession:
+    """Persistent SSH connection to iLO4.
+
+    Keeps a single SSH session open and sends fan commands via stdin.
+    Reconnects automatically if the session dies. This avoids opening
+    a new SSH connection every cycle, which can crash iLO's embedded
+    SSH daemon over time (memory leak / session table exhaustion).
+    """
+
+    def __init__(self, cfg: dict):
+        self._cfg = cfg
+        self._proc = None
+
+    def _build_ssh_cmd(self) -> list[str]:
+        ilo = self._cfg["ilo"]
+        return [
+            "sshpass", "-p", ilo["password"],
+            "ssh",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", f"KexAlgorithms={ilo['ssh_kex']}",
+            "-o", "HostKeyAlgorithms=ssh-rsa",
+            "-o", "Ciphers=aes256-ctr",
+            "-o", "PubkeyAcceptedAlgorithms=ssh-rsa",
+            "-o", "ConnectTimeout=10",
+            "-o", "ServerAliveInterval=30",
+            "-o", "ServerAliveCountMax=3",
+            "-tt",
+            f"{ilo['username']}@{ilo['host']}",
+        ]
+
+    def _is_alive(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    def connect(self) -> bool:
+        """Open persistent SSH session to iLO."""
+        if self._is_alive():
+            return True
+        self.close()
+        try:
+            self._proc = subprocess.Popen(
+                self._build_ssh_cmd(),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            time.sleep(3)
+            if not self._is_alive():
+                stderr = ""
+                if self._proc.stderr:
+                    try:
+                        stderr = self._proc.stderr.read1(4096).decode(errors="replace")
+                    except Exception:
+                        pass
+                LOG.error("SSH session failed to start: %s", stderr.strip())
+                self._proc = None
+                return False
+            LOG.info("Persistent SSH session to iLO established")
+            return True
+        except Exception as e:
+            LOG.error("Failed to open SSH session: %s", e)
+            self._proc = None
+            return False
+
+    def send_commands(self, commands: list[str]) -> bool:
+        """Send commands to the persistent SSH session."""
+        if not self._is_alive():
+            if not self.connect():
+                return False
+        try:
+            data = "\n".join(commands) + "\n"
+            self._proc.stdin.write(data.encode())
+            self._proc.stdin.flush()
+            time.sleep(0.5)
+            if not self._is_alive():
+                LOG.warning("SSH session died after sending commands, reconnecting next cycle")
+                self._proc = None
+                return False
+            return True
+        except (BrokenPipeError, OSError) as e:
+            LOG.warning("SSH pipe broken (%s), reconnecting next cycle", e)
+            self.close()
+            return False
+
+    def close(self):
+        """Close the SSH session."""
+        if self._proc is not None:
+            try:
+                if self._proc.stdin:
+                    try:
+                        self._proc.stdin.write(b"exit\n")
+                        self._proc.stdin.flush()
+                    except (BrokenPipeError, OSError):
+                        pass
+                self._proc.terminate()
+                try:
+                    self._proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self._proc.kill()
+                    self._proc.wait(timeout=3)
+            except Exception:
+                pass
+            finally:
+                self._proc = None
+            LOG.info("SSH session closed")
+
+
+def set_fans_ssh(cfg: dict, fan_percent: float, fan_count: int = 8, dry_run: bool = False,
+                ssh_session: IloSshSession = None) -> bool:
     """Set fan speeds via SSH to iLO4.
 
     iLO SSH is an interactive CLI, not a shell. Commands must be sent
@@ -423,6 +531,16 @@ def set_fans_ssh(cfg: dict, fan_percent: float, fan_count: int = 8, dry_run: boo
         LOG.info("[DRY-RUN] Fan speed: %d%% (raw: %d/255)", fan_percent, speed_raw)
         return True
 
+    # Use persistent session if available, fall back to one-shot
+    if ssh_session is not None:
+        ok = ssh_session.send_commands(commands)
+        if ok:
+            LOG.info("Fans set to %d%% (raw %d/255) via persistent SSH", fan_percent, speed_raw)
+        else:
+            LOG.error("Failed to set fans via persistent SSH")
+        return ok
+
+    # Fallback: one-shot SSH (for --once mode or when no session provided)
     ssh_cmd = [
         "sshpass", "-p", ilo["password"],
         "ssh", "-o", "StrictHostKeyChecking=no",
@@ -433,31 +551,20 @@ def set_fans_ssh(cfg: dict, fan_percent: float, fan_count: int = 8, dry_run: boo
         "-o", "ConnectTimeout=10",
         f"{ilo['username']}@{ilo['host']}",
     ]
-
-    # iLO SSH is an interactive CLI that doesn't exit cleanly.
-    # Send commands via stdin, use system timeout to force-close.
     stdin_data = "\n".join(commands) + "\nexit\n"
-
     try:
-        # Wrap with timeout(1) since iLO SSH hangs after exit
         result = subprocess.run(
             ["timeout", "20"] + ssh_cmd,
             input=stdin_data,
             capture_output=True, text=True, timeout=25
         )
         output = result.stdout + result.stderr
-        # Check for auth/connection errors
         if "Permission denied" in output:
             LOG.error("SSH auth failed: %s", result.stderr.strip())
             return False
         if "Connection refused" in output or "No route" in output:
             LOG.error("SSH connection failed: %s", result.stderr.strip())
             return False
-        if "Unable to negotiate" in output:
-            LOG.error("SSH cipher mismatch: %s", result.stderr.strip())
-            return False
-        # Exit code 124 = timeout killed it (expected for iLO)
-        # Commands were already sent and executed before timeout
         LOG.info("Fans set to %d%% (raw %d/255)", fan_percent, speed_raw)
         return True
     except subprocess.TimeoutExpired:
@@ -491,7 +598,8 @@ def setup_logging(cfg: dict):
 def run_once(cfg: dict, dry_run: bool = False, state: dict = None,
              outdoor: "OutdoorTemp" = None,
              cooling: "CoolingDetector" = None,
-             escalation: "EscalationTracker" = None) -> dict:
+             escalation: "EscalationTracker" = None,
+             ssh_session: "IloSshSession" = None) -> dict:
     """Single control loop iteration. Returns updated state."""
     if state is None:
         state = {"failures": 0, "last_pct": None}
@@ -505,7 +613,7 @@ def run_once(cfg: dict, dry_run: bool = False, state: dict = None,
             failsafe = cfg.get("failsafe_percent", 80)
             LOG.warning("No sensor data for %d cycles → failsafe %d%%",
                         state["failures"], failsafe)
-            set_fans_ssh(cfg, failsafe, dry_run=dry_run)
+            set_fans_ssh(cfg, failsafe, dry_run=dry_run, ssh_session=ssh_session)
             state["last_pct"] = failsafe
         return state
 
@@ -547,7 +655,7 @@ def run_once(cfg: dict, dry_run: bool = False, state: dict = None,
         return state
 
     LOG.info("Temps: %s%s → Fan: %.0f%%", temp_str, extra, target)
-    set_fans_ssh(cfg, target, dry_run=dry_run)
+    set_fans_ssh(cfg, target, dry_run=dry_run, ssh_session=ssh_session)
     state["last_pct"] = target
     return state
 
@@ -587,14 +695,22 @@ def main():
                  outdoor=outdoor, cooling=cooling, escalation=escalation)
         return
 
-    while running:
-        try:
-            state = run_once(cfg, dry_run=args.dry_run, state=state,
-                             outdoor=outdoor, cooling=cooling,
-                             escalation=escalation)
-        except Exception as e:
-            LOG.exception("Unexpected error: %s", e)
-        time.sleep(cfg["interval"])
+    # Persistent SSH session — one connection, reused across cycles
+    ssh_session = IloSshSession(cfg) if not args.dry_run else None
+
+    try:
+        while running:
+            try:
+                state = run_once(cfg, dry_run=args.dry_run, state=state,
+                                 outdoor=outdoor, cooling=cooling,
+                                 escalation=escalation,
+                                 ssh_session=ssh_session)
+            except Exception as e:
+                LOG.exception("Unexpected error: %s", e)
+            time.sleep(cfg["interval"])
+    finally:
+        if ssh_session:
+            ssh_session.close()
 
 
 if __name__ == "__main__":
