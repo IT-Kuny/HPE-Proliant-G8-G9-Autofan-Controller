@@ -11,7 +11,8 @@ apt-get install -y lm-sensors sshpass python3-yaml 2>/dev/null || true
 sensors-detect --auto 2>/dev/null || true
 
 # Deploy files
-mkdir -p /opt/fan-controller /etc/fan-controller
+mkdir -p /opt/fan-controller
+mkdir -m 700 -p /etc/fan-controller
 cp fan-controller.py /opt/fan-controller/
 chmod +x /opt/fan-controller/fan-controller.py
 cp config.yaml /etc/fan-controller/
@@ -22,8 +23,12 @@ if ! grep -q "ILO_PASSWORD" /etc/fan-controller/env 2>/dev/null; then
     echo "# Set iLO password here" > /etc/fan-controller/env
     echo 'ILO_PASSWORD=""' >> /etc/fan-controller/env
     chmod 600 /etc/fan-controller/env
+    chown root:root /etc/fan-controller/env
     echo "⚠ Set ILO_PASSWORD in /etc/fan-controller/env"
 fi
 
+chmod 700 /etc/fan-controller
+chmod 600 /etc/fan-controller/*
+chown -R root:root /etc/fan-controller
 systemctl daemon-reload
 echo "✅ Installed. Start with: systemctl enable --now fan-controller"
