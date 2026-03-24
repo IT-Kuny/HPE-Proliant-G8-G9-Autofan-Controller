@@ -1,6 +1,8 @@
-# Herkules Fan Controller
+# **Addon**: HPE-Proliant-G8-G9-Autofan-Controller
 
-Standalone thermal fan controller for HP DL360p Gen8 with modded iLO4 firmware.
+Thermal fan controller for HP DL360p Gen8 with modded iLO4 firmware.
+
+Requires [REST supported iLO Fan Controller Server](https://github.com/IT-Kuny/HPE-G8-G9-Fan-Controller)
 
 ## Features
 - Per-sensor fan curves (each sensor has its own temperature-to-fan mapping)
