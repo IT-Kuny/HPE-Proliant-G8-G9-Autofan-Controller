@@ -1,11 +1,11 @@
-# Herkules Fan Controller Configuration
+# HPE G8 Fan Controller Configuration
 # HP DL360p Gen8 with modded iLO4 firmware
 # Priority: HD Controller > LOM Card > CPU > rest
 # Target: 28% winter baseline, max 50% summer peak, ~42% evening with AC
 
 ilo:
-  host: "10.12.2.4"
-  username: "hx"
+  host: "10.11.12.13"
+  username: "Administrator"
   password: ""  # Set via env ILO_PASSWORD or /etc/fan-controller/env
   ssh_kex: "diffie-hellman-group14-sha1"
 
