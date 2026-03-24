@@ -278,9 +278,81 @@ def interpolate_fan(curve: list[list[float]], temp: float, min_pct: float) -> fl
     return max(curve[-1][1], min_pct)
 
 
+# ---------------------------------------------------------------------------
+# Escalation tracker — if temps keep rising despite fan speed, break limits
+# ---------------------------------------------------------------------------
+
+class EscalationTracker:
+    """Track per-sensor temp trends. If temps rise continuously for
+    escalation_window seconds, override curve limits progressively."""
+
+    def __init__(self, cfg: dict):
+        esc_cfg = cfg.get("escalation", {})
+        self.enabled = esc_cfg.get("enabled", True)
+        self.window = esc_cfg.get("window_seconds", 180)  # 3 minutes
+        self.step = esc_cfg.get("step_percent", 10)
+        self.max_override = esc_cfg.get("max_percent", 100)
+        # Per-sensor: deque of (timestamp, temp)
+        self.history: dict[str, deque] = {}
+        self.escalation_pct: float = 0.0
+
+    def record(self, temps: dict[str, float]):
+        if not self.enabled:
+            return
+        now = time.time()
+        for sensor_id, temp in temps.items():
+            if sensor_id not in self.history:
+                self.history[sensor_id] = deque(maxlen=200)
+            self.history[sensor_id].append((now, temp))
+
+        self._evaluate(now)
+
+    def _evaluate(self, now: float):
+        """Check if ANY sensor has been continuously rising over the window."""
+        cutoff = now - self.window
+        rising_sensors = []
+
+        for sensor_id, hist in self.history.items():
+            # Get readings within window
+            window_readings = [(t, temp) for t, temp in hist if t >= cutoff]
+            if len(window_readings) < 6:  # Need at least 6 readings (~90s)
+                continue
+
+            # Check if trend is consistently upward
+            temps_in_window = [temp for _, temp in window_readings]
+            first_half = temps_in_window[:len(temps_in_window)//2]
+            second_half = temps_in_window[len(temps_in_window)//2:]
+            avg_first = sum(first_half) / len(first_half)
+            avg_second = sum(second_half) / len(second_half)
+
+            # Rising if second half is >2°C hotter than first half
+            if avg_second - avg_first >= 2.0:
+                rising_sensors.append(
+                    f"{sensor_id} ({avg_first:.0f}→{avg_second:.0f}°C)")
+
+        old_pct = self.escalation_pct
+        if rising_sensors:
+            self.escalation_pct = min(
+                self.escalation_pct + self.step,
+                self.max_override
+            )
+            if self.escalation_pct != old_pct:
+                LOG.warning("ESCALATION +%d%%: temps still rising after %ds — %s",
+                            int(self.escalation_pct), self.window,
+                            ", ".join(rising_sensors))
+        else:
+            # Temps stabilized or dropping — de-escalate
+            if self.escalation_pct > 0:
+                self.escalation_pct = max(self.escalation_pct - self.step, 0)
+                if self.escalation_pct != old_pct:
+                    LOG.info("De-escalation: temps stabilized → override now %d%%",
+                             int(self.escalation_pct))
+
+
 def compute_target_fan(cfg: dict, temps: dict[str, float],
                        boost: float = 0.0,
-                       cooling_mode: str = "unknown") -> float:
+                       cooling_mode: str = "unknown",
+                       escalation_pct: float = 0.0) -> float:
     """Compute target fan percentage from sensor readings using per-sensor curves."""
     min_pct = cfg["min_fan_percent"]
     sensors_cfg = cfg.get("sensors", {})
@@ -310,6 +382,11 @@ def compute_target_fan(cfg: dict, temps: dict[str, float],
     if boost > 0:
         target = min(target + boost, 100.0)
         LOG.info("Boost +%.0f%% applied → %.0f%%", boost, target)
+
+    # Apply escalation override (temps still rising despite fan speed)
+    if escalation_pct > 0:
+        target = min(target + escalation_pct, 100.0)
+        LOG.warning("Escalation +%.0f%% → %.0f%%", escalation_pct, target)
 
     # Apply cooling discount (active cooling detected = can run quieter)
     if cooling_mode == "active":
@@ -394,7 +471,8 @@ def setup_logging(cfg: dict):
 
 def run_once(cfg: dict, dry_run: bool = False, state: dict = None,
              outdoor: "OutdoorTemp" = None,
-             cooling: "CoolingDetector" = None) -> dict:
+             cooling: "CoolingDetector" = None,
+             escalation: "EscalationTracker" = None) -> dict:
     """Single control loop iteration. Returns updated state."""
     if state is None:
         state = {"failures": 0, "last_pct": None}
@@ -420,6 +498,10 @@ def run_once(cfg: dict, dry_run: bool = False, state: dict = None,
     if cooling:
         cooling.record(inlet_temp, outdoor_temp)
 
+    # Track escalation
+    if escalation:
+        escalation.record(temps)
+
     boost = compute_boost(cfg, temps, outdoor_temp)
 
     # Log temps
@@ -429,10 +511,15 @@ def run_once(cfg: dict, dry_run: bool = False, state: dict = None,
         extra += f" | outdoor: {outdoor_temp:.0f}°C"
     if cooling and cooling.cooling_mode != "unknown":
         extra += f" | cooling: {cooling.cooling_mode}"
+    if escalation and escalation.escalation_pct > 0:
+        extra += f" | ESCALATION: +{escalation.escalation_pct:.0f}%"
     LOG.debug("Temps: %s%s", temp_str, extra)
 
     cooling_mode = cooling.cooling_mode if cooling else "unknown"
-    target = compute_target_fan(cfg, temps, boost=boost, cooling_mode=cooling_mode)
+    esc_pct = escalation.escalation_pct if escalation else 0.0
+    target = compute_target_fan(cfg, temps, boost=boost,
+                                cooling_mode=cooling_mode,
+                                escalation_pct=esc_pct)
     target = round(target, 1)
 
     # Only update if changed by >= 1%
@@ -473,17 +560,19 @@ def main():
 
     outdoor = OutdoorTemp(cfg)
     cooling = CoolingDetector(cfg)
+    escalation = EscalationTracker(cfg)
     state = {"failures": 0, "last_pct": None}
 
     if args.once:
         run_once(cfg, dry_run=args.dry_run, state=state,
-                 outdoor=outdoor, cooling=cooling)
+                 outdoor=outdoor, cooling=cooling, escalation=escalation)
         return
 
     while running:
         try:
             state = run_once(cfg, dry_run=args.dry_run, state=state,
-                             outdoor=outdoor, cooling=cooling)
+                             outdoor=outdoor, cooling=cooling,
+                             escalation=escalation)
         except Exception as e:
             LOG.exception("Unexpected error: %s", e)
         time.sleep(cfg["interval"])

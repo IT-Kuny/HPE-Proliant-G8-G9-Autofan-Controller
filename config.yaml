@@ -1,20 +1,18 @@
 # Herkules Fan Controller Configuration
 # HP DL360p Gen8 with modded iLO4 firmware
+# Priority: HD Controller > LOM Card > CPU > rest
+# Target: 28% winter baseline, max 50% summer peak, ~42% evening with AC
 
 ilo:
   host: "10.12.2.4"
-  username: "root"
+  username: "hx"
   password: ""  # Set via env ILO_PASSWORD or /etc/fan-controller/env
   ssh_kex: "diffie-hellman-group14-sha1"
 
 interval: 15
 
-# 34% minimum required for Intel DC NVMe + HD Controller
-min_fan_percent: 34
-
-# Per-sensor fan curves: [temp_celsius, fan_percent]
-# Each sensor has its own curve based on its operating range
-# The sensor demanding the highest fan speed wins
+# 28% minimum - winter/night baseline
+min_fan_percent: 28
 
 sensors:
   inlet:
@@ -22,97 +20,114 @@ sensors:
     source: "ipmi"
     critical_temp: 45
     fan_curve:
-      - [20, 34]
-      - [25, 36]
-      - [30, 45]
-      - [35, 60]
-      - [40, 80]
+      - [20, 28]
+      - [28, 36]
+      - [33, 40]
+      - [38, 48]
+      - [42, 50]
       - [45, 100]
 
+  # --- PRIMARY: HD Controller (most heat-sensitive component) ---
+  hd_controller:
+    name: "31-HD Controller"
+    source: "ipmi"
+    critical_temp: 100
+    fan_curve:
+      - [50, 28]
+      - [62, 34]
+      - [68, 38]
+      - [75, 42]
+      - [82, 48]
+      - [88, 50]
+      - [95, 80]
+      - [98, 100]
+
+  # --- PRIMARY: LOM Card (runs hot, needs attention) ---
+  lom_card:
+    name: "35-LOM Card"
+    source: "ipmi"
+    critical_temp: 90
+    fan_curve:
+      - [45, 28]
+      - [63, 34]
+      - [68, 38]
+      - [73, 42]
+      - [78, 48]
+      - [82, 50]
+      - [86, 80]
+      - [89, 100]
+
+  # --- SECONDARY: CPUs ---
   cpu1:
     name: "coretemp-isa-0000"
     source: "sensors"
     critical_temp: 90
     fan_curve:
-      - [40, 34]
-      - [50, 38]
-      - [60, 50]
-      - [70, 65]
-      - [80, 85]
-      - [85, 100]
+      - [40, 28]
+      - [55, 34]
+      - [65, 38]
+      - [72, 42]
+      - [78, 48]
+      - [83, 50]
+      - [87, 80]
+      - [89, 100]
 
   cpu2:
     name: "coretemp-isa-0001"
     source: "sensors"
     critical_temp: 90
     fan_curve:
-      - [40, 34]
-      - [50, 38]
-      - [60, 50]
-      - [70, 65]
-      - [80, 85]
-      - [85, 100]
-
-  hd_controller:
-    name: "31-HD Controller"
-    source: "ipmi"
-    critical_temp: 100
-    fan_curve:
-      - [50, 34]
-      - [60, 38]
-      - [70, 45]
-      - [80, 65]
-      - [85, 80]
-      - [90, 100]
-
-  lom_card:
-    name: "35-LOM Card"
-    source: "ipmi"
-    critical_temp: 90
-    fan_curve:
-      - [45, 34]
-      - [55, 38]
-      - [65, 48]
-      - [75, 65]
-      - [80, 85]
-      - [85, 100]
+      - [40, 28]
+      - [55, 34]
+      - [65, 38]
+      - [72, 42]
+      - [78, 48]
+      - [83, 50]
+      - [87, 80]
+      - [89, 100]
 
   chipset:
     name: "13-Chipset 1"
     source: "ipmi"
     critical_temp: 95
     fan_curve:
-      - [40, 34]
-      - [50, 38]
-      - [60, 50]
-      - [70, 65]
-      - [80, 85]
-      - [90, 100]
+      - [40, 28]
+      - [55, 34]
+      - [65, 38]
+      - [75, 42]
+      - [82, 48]
+      - [88, 50]
+      - [92, 80]
+      - [94, 100]
 
 # Outdoor temperature integration (Open-Meteo, Basel)
 outdoor:
   enabled: true
   latitude: 47.5596
   longitude: 7.5886
-  poll_interval: 600  # seconds (10min)
+  poll_interval: 600
 
-  # Proactive boost: only activates when BOTH conditions are true
-  # 1) outdoor temp exceeds threshold AND
-  # 2) at least one critical sensor (hd_controller, lom_card) is elevated
-  boost_outdoor_temp: 28       # °C outside
+  # Boost only in extreme heat + sensors elevated
+  boost_outdoor_temp: 33
   boost_sensor_thresholds:
-    hd_controller: 75          # °C
-    lom_card: 70               # °C
-  boost_percent: 10            # added to all curve outputs
+    hd_controller: 82
+    lom_card: 78
+  boost_percent: 5
 
-# Adaptive cooling detection
+# Adaptive cooling detection (AC!)
 adaptive:
   enabled: true
-  history_window: 3600         # seconds (1h) of inlet temp history
-  correlation_threshold: 0.7   # inlet vs outdoor correlation
-  # If correlation < threshold → active cooling detected → reduce fans
-  # If correlation >= threshold → passive cooling → normal operation
-  discount_percent: 5          # subtracted from fan target when active cooling detected
+  history_window: 3600
+  correlation_threshold: 0.7
+  # AC running = can discount fans
+  discount_percent: 5
+
+# Escalation: if temps keep rising for 3min despite fan speed, break curve limits
+escalation:
+  enabled: true
+  window_seconds: 180    # 3 minutes
+  step_percent: 10       # add 10% per evaluation while rising
+  max_percent: 100       # can go up to 100% if needed
 
 log_level: "INFO"
 log_file: "/var/log/fan-controller.log"
