@@ -407,14 +407,17 @@ class IloSshSession:
     """Persistent SSH connection to iLO4.
 
     Keeps a single SSH session open and sends fan commands via stdin.
-    Reconnects automatically if the session dies. This avoids opening
-    a new SSH connection every cycle, which can crash iLO's embedded
-    SSH daemon over time (memory leak / session table exhaustion).
+    Reconnects automatically if the session dies or becomes unresponsive.
+    Uses select() to detect stale connections that appear alive but don't
+    respond — the root cause of the fan controller hanging silently.
     """
 
     def __init__(self, cfg: dict):
         self._cfg = cfg
         self._proc = None
+        self._consecutive_failures = 0
+        self._max_failures = 3
+        self._send_timeout = 10  # seconds to wait for pipe write
 
     def _build_ssh_cmd(self) -> list[str]:
         ilo = self._cfg["ilo"]
@@ -427,14 +430,24 @@ class IloSshSession:
             "-o", "Ciphers=aes256-ctr",
             "-o", "PubkeyAcceptedAlgorithms=ssh-rsa",
             "-o", "ConnectTimeout=10",
-            "-o", "ServerAliveInterval=30",
-            "-o", "ServerAliveCountMax=3",
+            "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=2",
             "-tt",
             f"{ilo['username']}@{ilo['host']}",
         ]
 
     def _is_alive(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
+
+    def _drain_stdout(self):
+        """Non-blocking drain of stdout to prevent pipe buffer filling up."""
+        if self._proc and self._proc.stdout:
+            import select
+            while select.select([self._proc.stdout], [], [], 0)[0]:
+                try:
+                    self._proc.stdout.read1(4096)
+                except Exception:
+                    break
 
     def connect(self) -> bool:
         """Open persistent SSH session to iLO."""
@@ -459,7 +472,8 @@ class IloSshSession:
                 LOG.error("SSH session failed to start: %s", stderr.strip())
                 self._proc = None
                 return False
-            LOG.info("Persistent SSH session to iLO established")
+            self._consecutive_failures = 0
+            LOG.info("Persistent SSH session to iLO established (PID %d)", self._proc.pid)
             return True
         except Exception as e:
             LOG.error("Failed to open SSH session: %s", e)
@@ -467,28 +481,86 @@ class IloSshSession:
             return False
 
     def send_commands(self, commands: list[str]) -> bool:
-        """Send commands to the persistent SSH session."""
+        """Send commands to the persistent SSH session with timeout protection."""
         if not self._is_alive():
             if not self.connect():
+                self._consecutive_failures += 1
                 return False
+
+        # Drain any buffered stdout to prevent pipe deadlock
+        self._drain_stdout()
+
         try:
             data = "\n".join(commands) + "\n"
-            self._proc.stdin.write(data.encode())
-            self._proc.stdin.flush()
-            time.sleep(0.5)
-            if not self._is_alive():
-                LOG.warning("SSH session died after sending commands, reconnecting next cycle")
-                self._proc = None
+
+            # Use a thread to detect blocking writes
+            import threading
+            write_ok = threading.Event()
+            write_err = [None]
+
+            def _do_write():
+                try:
+                    self._proc.stdin.write(data.encode())
+                    self._proc.stdin.flush()
+                    write_ok.set()
+                except Exception as e:
+                    write_err[0] = e
+                    write_ok.set()
+
+            t = threading.Thread(target=_do_write, daemon=True)
+            t.start()
+            t.join(timeout=self._send_timeout)
+
+            if not write_ok.is_set():
+                # Write timed out — session is stuck
+                LOG.error("SSH write timed out after %ds — session stuck, forcing reconnect",
+                          self._send_timeout)
+                self._force_kill()
+                self._consecutive_failures += 1
                 return False
+
+            if write_err[0] is not None:
+                raise write_err[0]
+
+            # Brief pause then check if session survived
+            time.sleep(0.3)
+            if not self._is_alive():
+                LOG.warning("SSH session died after sending commands")
+                self._proc = None
+                self._consecutive_failures += 1
+                return False
+
+            self._consecutive_failures = 0
             return True
+
         except (BrokenPipeError, OSError) as e:
             LOG.warning("SSH pipe broken (%s), reconnecting next cycle", e)
             self.close()
+            self._consecutive_failures += 1
             return False
 
-    def close(self):
-        """Close the SSH session."""
+    def _force_kill(self):
+        """Force-kill a stuck SSH session."""
         if self._proc is not None:
+            pid = self._proc.pid
+            try:
+                self._proc.kill()
+                self._proc.wait(timeout=3)
+            except Exception:
+                pass
+            finally:
+                self._proc = None
+            LOG.warning("Force-killed stuck SSH session (PID %d)", pid)
+
+    @property
+    def healthy(self) -> bool:
+        """Check if session is in a good state."""
+        return self._consecutive_failures < self._max_failures
+
+    def close(self):
+        """Close the SSH session gracefully."""
+        if self._proc is not None:
+            pid = self._proc.pid
             try:
                 if self._proc.stdin:
                     try:
@@ -506,7 +578,7 @@ class IloSshSession:
                 pass
             finally:
                 self._proc = None
-            LOG.info("SSH session closed")
+            LOG.info("SSH session closed (PID %d)", pid)
 
 
 def set_fans_ssh(cfg: dict, fan_percent: float, fan_count: int = 8, dry_run: bool = False,
