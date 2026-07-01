@@ -1,17 +1,20 @@
 # HPE G8 Fan Controller Configuration
-# HP DL360p Gen8 with modded iLO4 firmware
+# HP DL360p Gen8 with modded iLO4 + Fan Mod firmware
 # Calibrated: 2026-07-01 — Summer baseline (Hitzewelle peak 2026-06-29)
-# Strategy: global max-wins, all fans move together, smooth ramp ±3%/1% per cycle
-# Data source: InfluxDB 7-day stats (mean + peak)
+# Strategy: global max-wins, all fans move together, smooth ramp ±2%/cycle
 #
-# Sensor baselines (7d mean → peak):
+# Profile system:
+#   mode: calendar  → switches by astronomical seasons (Mar20/Jun21/Sep23/Dec21)
+#   mode: auto      → switches by outdoor temperature thresholds
+#   mode: manual    → use --profile <name> CLI arg or profile: fixed below
+#
+# Sensor baselines (7d mean → peak, 2026-06-24 to 2026-07-01):
 #   Inlet Ambient:  32°C → 38°C
 #   CPU 1/2:        40°C → 45/46°C
 #   Chipset 1:      53°C → 60°C
 #   VR P1/P2:       46/48°C → 58/57°C
 #   HD Controller:  68°C → 78°C
 #   LOM Card:       69°C → 76°C
-#   Sys Exhaust:    43-47°C → 49-54°C
 
 ilo:
   host: "10.11.12.13"
@@ -21,135 +24,420 @@ ilo:
 
 interval: 15
 
-# 33% summer baseline (up from 28% winter)
-min_fan_percent: 33
+# Profile selection mode: calendar | auto | manual
+profile_mode: calendar
 
-# Ramp rate limiting — smooth transitions, reduces noise
-# All fans move together to global_speed = max(all sensor curves)
+# Manual override — only used when profile_mode: manual
+# profile: summer
+
+# Auto mode: switch profile based on outdoor temperature
+auto_profile:
+  winter_below: 8
+  spring_below: 18
+  summer_above: 24
+  # between spring_below and summer_above = spring or autumn (by calendar half-year)
+
+# Ramp rate (shared across all profiles — Fan Mod gives full control)
 ramp:
-  up_per_cycle: 2      # max +2% per 15s cycle when heating up
-  down_per_cycle: 2    # max -2% per 15s cycle when cooling down
-  tolerance_pct: 5     # fan blocks allowed ±5% from global target (Fan Mod)
+  up_per_cycle: 2    # max +2% per 15s cycle
+  down_per_cycle: 2  # max -2% per 15s cycle
+  tolerance_pct: 5   # fan blocks allowed ±5% from global target
 
-sensors:
-  # --- AMBIENT: Inlet drives global baseline ---
-  inlet:
-    name: "01-Inlet Ambient"
-    source: "ipmi"
-    critical_temp: 45
-    # Mean 32°C, Peak 38°C — curves shifted up for summer home environment
-    fan_curve:
-      - [22, 33]
-      - [28, 36]
-      - [32, 40]
-      - [35, 44]
-      - [37, 48]
-      - [38, 52]
-      - [40, 58]
-      - [43, 70]
-      - [45, 100]
+# ---------------------------------------------------------------------------
+# PROFILES
+# ---------------------------------------------------------------------------
 
-  # --- PRIMARY: HD Controller (structurally hottest, mean 68°C) ---
-  hd_controller:
-    name: "31-HD Controller"
-    source: "ipmi"
-    critical_temp: 100
-    # Mean 68°C, Peak 78°C — react earlier, smoother climb
-    fan_curve:
-      - [50, 33]
-      - [58, 36]
-      - [63, 40]
-      - [68, 46]
-      - [72, 52]
-      - [76, 58]
-      - [82, 68]
-      - [90, 85]
-      - [96, 100]
+profiles:
 
-  # --- PRIMARY: LOM Card (mean 69°C, peak 76°C) ---
-  lom_card:
-    name: "35-LOM Card"
-    source: "ipmi"
-    critical_temp: 90
-    fan_curve:
-      - [45, 33]
-      - [56, 36]
-      - [62, 40]
-      - [67, 46]
-      - [71, 52]
-      - [75, 58]
-      - [80, 68]
-      - [85, 85]
-      - [88, 100]
+  # ── SUMMER (Jun 21 – Sep 22) ─────────────────────────────────────────────
+  summer:
+    min_fan_percent: 33
+    sensors:
+      inlet:
+        name: "01-Inlet Ambient"
+        source: "ipmi"
+        critical_temp: 45
+        fan_curve:
+          - [22, 33]
+          - [28, 36]
+          - [32, 40]
+          - [35, 44]
+          - [37, 48]
+          - [38, 52]
+          - [40, 58]
+          - [43, 70]
+          - [45, 100]
+      hd_controller:
+        name: "31-HD Controller"
+        source: "ipmi"
+        critical_temp: 100
+        fan_curve:
+          - [50, 33]
+          - [58, 36]
+          - [63, 40]
+          - [68, 46]
+          - [72, 52]
+          - [76, 58]
+          - [82, 68]
+          - [90, 85]
+          - [96, 100]
+      lom_card:
+        name: "35-LOM Card"
+        source: "ipmi"
+        critical_temp: 90
+        fan_curve:
+          - [45, 33]
+          - [56, 36]
+          - [62, 40]
+          - [67, 46]
+          - [71, 52]
+          - [75, 58]
+          - [80, 68]
+          - [85, 85]
+          - [88, 100]
+      cpu1:
+        name: "coretemp-isa-0000"
+        source: "sensors"
+        critical_temp: 90
+        fan_curve:
+          - [35, 33]
+          - [42, 36]
+          - [50, 40]
+          - [58, 46]
+          - [65, 52]
+          - [72, 58]
+          - [80, 70]
+          - [85, 85]
+          - [89, 100]
+      cpu2:
+        name: "coretemp-isa-0001"
+        source: "sensors"
+        critical_temp: 90
+        fan_curve:
+          - [35, 33]
+          - [42, 36]
+          - [50, 40]
+          - [58, 46]
+          - [65, 52]
+          - [72, 58]
+          - [80, 70]
+          - [85, 85]
+          - [89, 100]
+      chipset:
+        name: "13-Chipset 1"
+        source: "ipmi"
+        critical_temp: 95
+        fan_curve:
+          - [38, 33]
+          - [46, 36]
+          - [52, 40]
+          - [56, 44]
+          - [59, 50]
+          - [62, 56]
+          - [70, 65]
+          - [82, 80]
+          - [92, 100]
+    outdoor_curve:
+      - [15, 33]
+      - [20, 35]
+      - [25, 38]
+      - [28, 42]
+      - [30, 46]
+      - [33, 52]
+      - [35, 58]
+      - [38, 65]
+      - [40, 75]
 
-  # --- SECONDARY: CPUs (mean 40°C, peak 46°C — relaxed) ---
-  cpu1:
-    name: "coretemp-isa-0000"
-    source: "sensors"
-    critical_temp: 90
-    fan_curve:
-      - [35, 33]
-      - [42, 36]
-      - [50, 40]
-      - [58, 46]
-      - [65, 52]
-      - [72, 58]
-      - [80, 70]
-      - [85, 85]
-      - [89, 100]
+  # ── SPRING (Mar 20 – Jun 20) ─────────────────────────────────────────────
+  spring:
+    min_fan_percent: 30
+    sensors:
+      inlet:
+        name: "01-Inlet Ambient"
+        source: "ipmi"
+        critical_temp: 45
+        fan_curve:
+          - [18, 30]
+          - [24, 33]
+          - [28, 37]
+          - [32, 42]
+          - [36, 48]
+          - [40, 58]
+          - [43, 72]
+          - [45, 100]
+      hd_controller:
+        name: "31-HD Controller"
+        source: "ipmi"
+        critical_temp: 100
+        fan_curve:
+          - [48, 30]
+          - [58, 34]
+          - [64, 38]
+          - [70, 44]
+          - [76, 52]
+          - [82, 62]
+          - [90, 80]
+          - [96, 100]
+      lom_card:
+        name: "35-LOM Card"
+        source: "ipmi"
+        critical_temp: 90
+        fan_curve:
+          - [43, 30]
+          - [55, 34]
+          - [63, 38]
+          - [69, 44]
+          - [74, 52]
+          - [79, 62]
+          - [84, 80]
+          - [88, 100]
+      cpu1:
+        name: "coretemp-isa-0000"
+        source: "sensors"
+        critical_temp: 90
+        fan_curve:
+          - [32, 30]
+          - [42, 34]
+          - [52, 38]
+          - [62, 44]
+          - [70, 52]
+          - [76, 62]
+          - [82, 76]
+          - [87, 90]
+          - [89, 100]
+      cpu2:
+        name: "coretemp-isa-0001"
+        source: "sensors"
+        critical_temp: 90
+        fan_curve:
+          - [32, 30]
+          - [42, 34]
+          - [52, 38]
+          - [62, 44]
+          - [70, 52]
+          - [76, 62]
+          - [82, 76]
+          - [87, 90]
+          - [89, 100]
+      chipset:
+        name: "13-Chipset 1"
+        source: "ipmi"
+        critical_temp: 95
+        fan_curve:
+          - [36, 30]
+          - [46, 34]
+          - [53, 38]
+          - [58, 44]
+          - [63, 52]
+          - [72, 62]
+          - [83, 78]
+          - [92, 100]
+    outdoor_curve:
+      - [5,  30]
+      - [12, 31]
+      - [18, 33]
+      - [22, 37]
+      - [26, 42]
+      - [30, 50]
+      - [35, 62]
+      - [38, 75]
 
-  cpu2:
-    name: "coretemp-isa-0001"
-    source: "sensors"
-    critical_temp: 90
-    fan_curve:
-      - [35, 33]
-      - [42, 36]
-      - [50, 40]
-      - [58, 46]
-      - [65, 52]
-      - [72, 58]
-      - [80, 70]
-      - [85, 85]
-      - [89, 100]
+  # ── AUTUMN (Sep 23 – Dec 20) ─────────────────────────────────────────────
+  autumn:
+    min_fan_percent: 30
+    sensors:
+      inlet:
+        name: "01-Inlet Ambient"
+        source: "ipmi"
+        critical_temp: 45
+        fan_curve:
+          - [18, 30]
+          - [24, 33]
+          - [28, 37]
+          - [32, 42]
+          - [36, 48]
+          - [40, 58]
+          - [43, 72]
+          - [45, 100]
+      hd_controller:
+        name: "31-HD Controller"
+        source: "ipmi"
+        critical_temp: 100
+        fan_curve:
+          - [48, 30]
+          - [58, 34]
+          - [64, 38]
+          - [70, 44]
+          - [76, 52]
+          - [82, 62]
+          - [90, 80]
+          - [96, 100]
+      lom_card:
+        name: "35-LOM Card"
+        source: "ipmi"
+        critical_temp: 90
+        fan_curve:
+          - [43, 30]
+          - [55, 34]
+          - [63, 38]
+          - [69, 44]
+          - [74, 52]
+          - [79, 62]
+          - [84, 80]
+          - [88, 100]
+      cpu1:
+        name: "coretemp-isa-0000"
+        source: "sensors"
+        critical_temp: 90
+        fan_curve:
+          - [32, 30]
+          - [42, 34]
+          - [52, 38]
+          - [62, 44]
+          - [70, 52]
+          - [76, 62]
+          - [82, 76]
+          - [87, 90]
+          - [89, 100]
+      cpu2:
+        name: "coretemp-isa-0001"
+        source: "sensors"
+        critical_temp: 90
+        fan_curve:
+          - [32, 30]
+          - [42, 34]
+          - [52, 38]
+          - [62, 44]
+          - [70, 52]
+          - [76, 62]
+          - [82, 76]
+          - [87, 90]
+          - [89, 100]
+      chipset:
+        name: "13-Chipset 1"
+        source: "ipmi"
+        critical_temp: 95
+        fan_curve:
+          - [36, 30]
+          - [46, 34]
+          - [53, 38]
+          - [58, 44]
+          - [63, 52]
+          - [72, 62]
+          - [83, 78]
+          - [92, 100]
+    outdoor_curve:
+      - [0,  30]
+      - [8,  31]
+      - [15, 33]
+      - [20, 37]
+      - [25, 43]
+      - [30, 52]
+      - [35, 64]
+      - [38, 75]
 
-  # --- SECONDARY: Chipset (mean 53°C, peak 60°C) ---
-  chipset:
-    name: "13-Chipset 1"
-    source: "ipmi"
-    critical_temp: 95
-    fan_curve:
-      - [38, 33]
-      - [46, 36]
-      - [52, 40]
-      - [56, 44]
-      - [59, 50]
-      - [62, 56]
-      - [70, 65]
-      - [82, 80]
-      - [92, 100]
+  # ── WINTER (Dec 21 – Mar 19) ─────────────────────────────────────────────
+  winter:
+    min_fan_percent: 28
+    sensors:
+      inlet:
+        name: "01-Inlet Ambient"
+        source: "ipmi"
+        critical_temp: 45
+        fan_curve:
+          - [15, 28]
+          - [20, 31]
+          - [25, 35]
+          - [30, 40]
+          - [34, 46]
+          - [38, 54]
+          - [42, 66]
+          - [45, 100]
+      hd_controller:
+        name: "31-HD Controller"
+        source: "ipmi"
+        critical_temp: 100
+        fan_curve:
+          - [45, 28]
+          - [56, 32]
+          - [63, 36]
+          - [70, 42]
+          - [76, 50]
+          - [82, 60]
+          - [90, 78]
+          - [96, 100]
+      lom_card:
+        name: "35-LOM Card"
+        source: "ipmi"
+        critical_temp: 90
+        fan_curve:
+          - [40, 28]
+          - [54, 32]
+          - [62, 36]
+          - [68, 42]
+          - [73, 50]
+          - [78, 60]
+          - [83, 78]
+          - [88, 100]
+      cpu1:
+        name: "coretemp-isa-0000"
+        source: "sensors"
+        critical_temp: 90
+        fan_curve:
+          - [30, 28]
+          - [40, 32]
+          - [50, 36]
+          - [60, 42]
+          - [68, 50]
+          - [75, 60]
+          - [81, 74]
+          - [86, 88]
+          - [89, 100]
+      cpu2:
+        name: "coretemp-isa-0001"
+        source: "sensors"
+        critical_temp: 90
+        fan_curve:
+          - [30, 28]
+          - [40, 32]
+          - [50, 36]
+          - [60, 42]
+          - [68, 50]
+          - [75, 60]
+          - [81, 74]
+          - [86, 88]
+          - [89, 100]
+      chipset:
+        name: "13-Chipset 1"
+        source: "ipmi"
+        critical_temp: 95
+        fan_curve:
+          - [34, 28]
+          - [44, 32]
+          - [52, 36]
+          - [57, 42]
+          - [62, 50]
+          - [70, 60]
+          - [82, 76]
+          - [92, 100]
+    outdoor_curve:
+      - [-10, 28]
+      - [0,   28]
+      - [5,   29]
+      - [10,  31]
+      - [15,  34]
+      - [20,  38]
+      - [25,  46]
+      - [30,  56]
+      - [35,  68]
 
-# Outdoor temperature (Open-Meteo, Basel) — direct curve input + boost
+# Outdoor temperature source (Open-Meteo, Basel)
 outdoor:
   enabled: true
   latitude: 47.5596
   longitude: 7.5886
   poll_interval: 600
-
-  # Outdoor temp fan curve — contributes to global max-wins calculation
-  # Home environment without rack: outdoor temp directly affects inlet
-  fan_curve:
-    - [15, 33]
-    - [20, 35]
-    - [25, 38]
-    - [28, 42]
-    - [30, 46]
-    - [33, 52]
-    - [35, 58]
-    - [38, 65]
-    - [40, 75]
-
-  # Additional boost on top of curve when both outdoor AND sensors are elevated
+  # Boost: outdoor AND sensors both elevated
   boost_outdoor_temp: 30
   boost_sensor_thresholds:
     hd_controller: 74
