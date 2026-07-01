@@ -27,9 +27,9 @@ min_fan_percent: 33
 # Ramp rate limiting — smooth transitions, reduces noise
 # All fans move together to global_speed = max(all sensor curves)
 ramp:
-  up_per_cycle: 3      # max +3% per 15s cycle when heating up
-  down_per_cycle: 1    # max -1% per 15s cycle when cooling down
-  tolerance_pct: 5     # HP iLO fan blocks allowed ±5% from global target
+  up_per_cycle: 2      # max +2% per 15s cycle when heating up
+  down_per_cycle: 2    # max -2% per 15s cycle when cooling down
+  tolerance_pct: 5     # fan blocks allowed ±5% from global target (Fan Mod)
 
 sensors:
   # --- AMBIENT: Inlet drives global baseline ---
