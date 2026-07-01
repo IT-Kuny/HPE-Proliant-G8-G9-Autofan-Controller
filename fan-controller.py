@@ -647,8 +647,8 @@ def run_once(cfg: dict, dry_run: bool = False, state: dict = None,
         state = {"failures": 0, "last_pct": None}
 
     ramp_cfg = cfg.get("ramp", {})
-    ramp_up = ramp_cfg.get("up_per_cycle", 3)
-    ramp_down = ramp_cfg.get("down_per_cycle", 1)
+    ramp_up = ramp_cfg.get("up_per_cycle", 2)
+    ramp_down = ramp_cfg.get("down_per_cycle", 2)
 
     temps = read_all_temps(cfg)
 
