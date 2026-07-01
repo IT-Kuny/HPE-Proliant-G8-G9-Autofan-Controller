@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
-"""Standalone thermal fan controller for HP DL360p Gen8 with modded iLO4."""
+"""Standalone thermal fan controller for HP DL360p Gen8 with modded iLO4.
+
+Changes (2026-07-01):
+  - Global max-wins mode: all fans move together to a single target speed
+  - Ramp-rate limiter: +3%/cycle up, -1%/cycle down (smooth transitions)
+  - ±5% tolerance band (HP iLO hardware allowance)
+  - Outdoor temperature contributes directly to global curve calculation
+  - Summer baseline: min_fan_percent 33% (from 28%)
+  - All curves recalibrated to 7-day data (Hitzewelle peak 2026-06-29)
+"""
 
 import argparse
 import json
 import logging
 import os
 import signal
-import ssl
 import subprocess
 import sys
 import time
 import urllib.request
-from base64 import b64encode
+from collections import deque
 from pathlib import Path
 
 import yaml
-
-from collections import deque
 
 LOG = logging.getLogger("fan-controller")
 
@@ -27,7 +33,6 @@ LOG = logging.getLogger("fan-controller")
 def load_config(path: str) -> dict:
     with open(path) as f:
         cfg = yaml.safe_load(f)
-    # env override for password
     if os.environ.get("ILO_PASSWORD"):
         cfg["ilo"]["password"] = os.environ["ILO_PASSWORD"]
     return cfg
@@ -72,15 +77,14 @@ class OutdoorTemp:
 # ---------------------------------------------------------------------------
 
 class CoolingDetector:
-    """Detect active cooling (AC/open window) by correlating inlet vs outdoor."""
+    """Detect active cooling (AC/open window) via inlet vs outdoor correlation."""
 
     def __init__(self, cfg: dict):
         self.cfg = cfg.get("adaptive", {})
         self.enabled = self.cfg.get("enabled", False)
         window = self.cfg.get("history_window", 3600)
-        # Store (timestamp, inlet_temp, outdoor_temp) tuples
         self.history: deque = deque(maxlen=max(window // 15, 60))
-        self.cooling_mode = "unknown"  # unknown, passive, active
+        self.cooling_mode = "unknown"
 
     def record(self, inlet_temp: float | None, outdoor_temp: float | None):
         if not self.enabled or inlet_temp is None or outdoor_temp is None:
@@ -93,10 +97,8 @@ class CoolingDetector:
             return
         inlets = [h[1] for h in self.history]
         outdoors = [h[2] for h in self.history]
-
         corr = self._pearson(inlets, outdoors)
         threshold = self.cfg.get("correlation_threshold", 0.7)
-
         old_mode = self.cooling_mode
         if corr is None:
             self.cooling_mode = "unknown"
@@ -104,9 +106,8 @@ class CoolingDetector:
             self.cooling_mode = "passive"
         else:
             self.cooling_mode = "active"
-
         if self.cooling_mode != old_mode:
-            LOG.info("Cooling mode changed: %s → %s (correlation: %.2f)",
+            LOG.info("Cooling mode: %s → %s (correlation: %.2f)",
                      old_mode, self.cooling_mode, corr or 0)
 
     @staticmethod
@@ -123,42 +124,183 @@ class CoolingDetector:
         return cov / (sx * sy)
 
 
-def compute_boost(cfg: dict, temps: dict[str, float], outdoor_temp: float | None) -> float:
-    """Calculate proactive fan boost based on ambient temp OR critical sensors.
-    
-    Uses outdoor temp if available, falls back to inlet temp as ambient proxy.
-    Boost activates when EITHER condition is true:
-    1) Ambient (outdoor or inlet) exceeds threshold
-    2) At least one critical sensor is elevated
+# ---------------------------------------------------------------------------
+# Fan curve interpolation
+# ---------------------------------------------------------------------------
+
+def interpolate_fan(curve: list[list[float]], temp: float, min_pct: float) -> float:
+    """Linear interpolation on a fan curve, respecting minimum."""
+    if temp <= curve[0][0]:
+        return max(curve[0][1], min_pct)
+    if temp >= curve[-1][0]:
+        return curve[-1][1]
+    for i in range(len(curve) - 1):
+        t0, f0 = curve[i]
+        t1, f1 = curve[i + 1]
+        if t0 <= temp <= t1:
+            ratio = (temp - t0) / (t1 - t0)
+            pct = f0 + ratio * (f1 - f0)
+            return max(pct, min_pct)
+    return max(curve[-1][1], min_pct)
+
+
+# ---------------------------------------------------------------------------
+# Escalation tracker
+# ---------------------------------------------------------------------------
+
+class EscalationTracker:
+    """If temps keep rising continuously for escalation_window seconds,
+    override curve limits progressively."""
+
+    def __init__(self, cfg: dict):
+        esc_cfg = cfg.get("escalation", {})
+        self.enabled = esc_cfg.get("enabled", True)
+        self.window = esc_cfg.get("window_seconds", 180)
+        self.step = esc_cfg.get("step_percent", 8)
+        self.max_override = esc_cfg.get("max_percent", 100)
+        self.history: dict[str, deque] = {}
+        self.escalation_pct: float = 0.0
+
+    def record(self, temps: dict[str, float]):
+        if not self.enabled:
+            return
+        now = time.time()
+        for sensor_id, temp in temps.items():
+            if sensor_id not in self.history:
+                self.history[sensor_id] = deque(maxlen=200)
+            self.history[sensor_id].append((now, temp))
+        self._evaluate(now)
+
+    def _evaluate(self, now: float):
+        cutoff = now - self.window
+        rising_sensors = []
+        for sensor_id, hist in self.history.items():
+            window_readings = [(t, temp) for t, temp in hist if t >= cutoff]
+            if len(window_readings) < 6:
+                continue
+            temps_in_window = [temp for _, temp in window_readings]
+            half = len(temps_in_window) // 2
+            avg_first = sum(temps_in_window[:half]) / half
+            avg_second = sum(temps_in_window[half:]) / (len(temps_in_window) - half)
+            if avg_second - avg_first >= 2.0:
+                rising_sensors.append(f"{sensor_id} ({avg_first:.0f}→{avg_second:.0f}°C)")
+
+        old_pct = self.escalation_pct
+        if rising_sensors:
+            self.escalation_pct = min(self.escalation_pct + self.step, self.max_override)
+            if self.escalation_pct != old_pct:
+                LOG.warning("ESCALATION +%d%%: still rising — %s",
+                            int(self.escalation_pct), ", ".join(rising_sensors))
+        else:
+            if self.escalation_pct > 0:
+                self.escalation_pct = max(self.escalation_pct - self.step, 0)
+                if self.escalation_pct != old_pct:
+                    LOG.info("De-escalation: stabilized → override %d%%",
+                             int(self.escalation_pct))
+
+
+# ---------------------------------------------------------------------------
+# Global target computation — max-wins with outdoor temp as direct input
+# ---------------------------------------------------------------------------
+
+def compute_target_fan(cfg: dict, temps: dict[str, float],
+                       outdoor_temp: float | None = None,
+                       cooling_mode: str = "unknown",
+                       escalation_pct: float = 0.0) -> float:
+    """Compute single global fan target — all fans get this same speed.
+
+    Strategy:
+      1. Each sensor curve produces a candidate speed
+      2. Outdoor temp curve also produces a candidate (direct input, not just boost)
+      3. global_target = max(all candidates)   ← max-wins
+      4. Apply boost if outdoor AND sensors both elevated
+      5. Apply escalation override if temps keep rising
+      6. Apply active-cooling discount if AC detected
     """
+    min_pct = cfg["min_fan_percent"]
+    sensors_cfg = cfg.get("sensors", {})
     outdoor_cfg = cfg.get("outdoor", {})
-    if not outdoor_cfg.get("enabled"):
-        return 0.0
+    candidates = []
 
-    boost_pct = outdoor_cfg.get("boost_percent", 10)
-    reasons = []
+    # --- Sensor curves ---
+    for sensor_id, temp in temps.items():
+        scfg = sensors_cfg.get(sensor_id, {})
+        critical = scfg.get("critical_temp", 100)
+        curve = scfg.get("fan_curve")
 
-    # Check ambient (outdoor or inlet fallback)
-    ambient = outdoor_temp
-    ambient_source = "outdoor"
-    if ambient is None:
-        ambient = temps.get("inlet")
-        ambient_source = "inlet"
+        if not curve:
+            LOG.warning("No fan_curve for sensor '%s', skipping", sensor_id)
+            continue
 
-    threshold = outdoor_cfg.get("boost_outdoor_temp", 28)
-    if ambient is not None and ambient >= threshold:
-        reasons.append(f"{ambient_source} {ambient:.0f}°C >= {threshold}°C")
+        if temp >= critical:
+            LOG.warning("CRITICAL: %s at %.1f°C (limit %d°C) → 100%%",
+                        sensor_id, temp, critical)
+            return 100.0
 
-    # Check critical sensors
-    sensor_thresholds = outdoor_cfg.get("boost_sensor_thresholds", {})
-    for sensor_id, temp_threshold in sensor_thresholds.items():
-        if sensor_id in temps and temps[sensor_id] >= temp_threshold:
-            reasons.append(f"{sensor_id} {temps[sensor_id]:.0f}°C >= {temp_threshold}°C")
+        fan_pct = interpolate_fan(curve, temp, min_pct)
+        LOG.debug("  sensor %s: %.1f°C → %.0f%%", sensor_id, temp, fan_pct)
+        candidates.append(fan_pct)
 
-    if reasons:
-        LOG.info("Boost +%d%%: %s", boost_pct, " | ".join(reasons))
-        return boost_pct
-    return 0.0
+    # --- Outdoor temp curve (direct input) ---
+    outdoor_curve = outdoor_cfg.get("fan_curve")
+    if outdoor_temp is not None and outdoor_curve:
+        outdoor_pct = interpolate_fan(outdoor_curve, outdoor_temp, min_pct)
+        LOG.debug("  outdoor: %.1f°C → %.0f%%", outdoor_temp, outdoor_pct)
+        candidates.append(outdoor_pct)
+
+    target = max(candidates) if candidates else min_pct
+
+    # --- Boost: outdoor AND sensors both elevated ---
+    if outdoor_temp is not None and outdoor_cfg.get("enabled"):
+        boost_outdoor_threshold = outdoor_cfg.get("boost_outdoor_temp", 30)
+        boost_sensor_thresholds = outdoor_cfg.get("boost_sensor_thresholds", {})
+        boost_pct = outdoor_cfg.get("boost_percent", 3)
+
+        ambient_hot = outdoor_temp >= boost_outdoor_threshold
+        sensor_hot = any(
+            temps.get(sid, 0) >= thr
+            for sid, thr in boost_sensor_thresholds.items()
+        )
+        if ambient_hot and sensor_hot:
+            old = target
+            target = min(target + boost_pct, 100.0)
+            LOG.info("Boost +%d%%: outdoor %.0f°C + sensors elevated (%.0f → %.0f%%)",
+                     boost_pct, outdoor_temp, old, target)
+
+    # --- Escalation override ---
+    if escalation_pct > 0:
+        old = target
+        target = min(target + escalation_pct, 100.0)
+        LOG.warning("Escalation +%.0f%% → %.0f%%", escalation_pct, target)
+
+    # --- Active cooling discount ---
+    if cooling_mode == "active":
+        discount = cfg.get("adaptive", {}).get("discount_percent", 4)
+        old = target
+        target = max(target - discount, min_pct)
+        LOG.info("Active cooling: -%.0f%% (%.0f → %.0f%%)", discount, old, target)
+
+    return target
+
+
+# ---------------------------------------------------------------------------
+# Ramp-rate limiter — smooth transitions
+# ---------------------------------------------------------------------------
+
+def apply_ramp(current: float | None, target: float,
+               up_per_cycle: float, down_per_cycle: float) -> float:
+    """Limit how fast fan speed changes per cycle.
+
+    - Heating up:   max +up_per_cycle% per cycle
+    - Cooling down: max -down_per_cycle% per cycle (slow decay = stays quieter)
+    """
+    if current is None:
+        return target
+    if target > current:
+        return min(target, current + up_per_cycle)
+    elif target < current:
+        return max(target, current - down_per_cycle)
+    return current
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +308,6 @@ def compute_boost(cfg: dict, temps: dict[str, float], outdoor_temp: float | None
 # ---------------------------------------------------------------------------
 
 def read_ipmi_temps() -> dict[str, float]:
-    """Read temperatures from ipmitool sdr."""
     try:
         result = subprocess.run(
             ["ipmitool", "sdr", "type", "Temperature"],
@@ -193,7 +334,6 @@ def read_ipmi_temps() -> dict[str, float]:
 
 
 def read_lmsensors_temps() -> dict[str, float]:
-    """Read temperatures from lm-sensors."""
     try:
         result = subprocess.run(
             ["sensors", "-j"],
@@ -225,7 +365,6 @@ def read_lmsensors_temps() -> dict[str, float]:
 
 
 def read_all_temps(cfg: dict) -> dict[str, float]:
-    """Read all configured sensor temperatures."""
     ipmi_temps = None
     sensor_temps = None
     results = {}
@@ -256,168 +395,20 @@ def read_all_temps(cfg: dict) -> dict[str, float]:
 
     return results
 
-# ---------------------------------------------------------------------------
-# Fan curve interpolation
-# ---------------------------------------------------------------------------
-
-def interpolate_fan(curve: list[list[float]], temp: float, min_pct: float) -> float:
-    """Linear interpolation on fan curve, respecting minimum."""
-    if temp <= curve[0][0]:
-        return max(curve[0][1], min_pct)
-    if temp >= curve[-1][0]:
-        return curve[-1][1]
-
-    for i in range(len(curve) - 1):
-        t0, f0 = curve[i]
-        t1, f1 = curve[i + 1]
-        if t0 <= temp <= t1:
-            ratio = (temp - t0) / (t1 - t0)
-            pct = f0 + ratio * (f1 - f0)
-            return max(pct, min_pct)
-
-    return max(curve[-1][1], min_pct)
-
-
-# ---------------------------------------------------------------------------
-# Escalation tracker — if temps keep rising despite fan speed, break limits
-# ---------------------------------------------------------------------------
-
-class EscalationTracker:
-    """Track per-sensor temp trends. If temps rise continuously for
-    escalation_window seconds, override curve limits progressively."""
-
-    def __init__(self, cfg: dict):
-        esc_cfg = cfg.get("escalation", {})
-        self.enabled = esc_cfg.get("enabled", True)
-        self.window = esc_cfg.get("window_seconds", 180)  # 3 minutes
-        self.step = esc_cfg.get("step_percent", 10)
-        self.max_override = esc_cfg.get("max_percent", 100)
-        # Per-sensor: deque of (timestamp, temp)
-        self.history: dict[str, deque] = {}
-        self.escalation_pct: float = 0.0
-
-    def record(self, temps: dict[str, float]):
-        if not self.enabled:
-            return
-        now = time.time()
-        for sensor_id, temp in temps.items():
-            if sensor_id not in self.history:
-                self.history[sensor_id] = deque(maxlen=200)
-            self.history[sensor_id].append((now, temp))
-
-        self._evaluate(now)
-
-    def _evaluate(self, now: float):
-        """Check if ANY sensor has been continuously rising over the window."""
-        cutoff = now - self.window
-        rising_sensors = []
-
-        for sensor_id, hist in self.history.items():
-            # Get readings within window
-            window_readings = [(t, temp) for t, temp in hist if t >= cutoff]
-            if len(window_readings) < 6:  # Need at least 6 readings (~90s)
-                continue
-
-            # Check if trend is consistently upward
-            temps_in_window = [temp for _, temp in window_readings]
-            first_half = temps_in_window[:len(temps_in_window)//2]
-            second_half = temps_in_window[len(temps_in_window)//2:]
-            avg_first = sum(first_half) / len(first_half)
-            avg_second = sum(second_half) / len(second_half)
-
-            # Rising if second half is >2°C hotter than first half
-            if avg_second - avg_first >= 2.0:
-                rising_sensors.append(
-                    f"{sensor_id} ({avg_first:.0f}→{avg_second:.0f}°C)")
-
-        old_pct = self.escalation_pct
-        if rising_sensors:
-            self.escalation_pct = min(
-                self.escalation_pct + self.step,
-                self.max_override
-            )
-            if self.escalation_pct != old_pct:
-                LOG.warning("ESCALATION +%d%%: temps still rising after %ds — %s",
-                            int(self.escalation_pct), self.window,
-                            ", ".join(rising_sensors))
-        else:
-            # Temps stabilized or dropping — de-escalate
-            if self.escalation_pct > 0:
-                self.escalation_pct = max(self.escalation_pct - self.step, 0)
-                if self.escalation_pct != old_pct:
-                    LOG.info("De-escalation: temps stabilized → override now %d%%",
-                             int(self.escalation_pct))
-
-
-def compute_target_fan(cfg: dict, temps: dict[str, float],
-                       boost: float = 0.0,
-                       cooling_mode: str = "unknown",
-                       escalation_pct: float = 0.0) -> float:
-    """Compute target fan percentage from sensor readings using per-sensor curves."""
-    min_pct = cfg["min_fan_percent"]
-    sensors_cfg = cfg.get("sensors", {})
-    target = min_pct
-
-    for sensor_id, temp in temps.items():
-        scfg = sensors_cfg.get(sensor_id, {})
-        critical = scfg.get("critical_temp", 100)
-        curve = scfg.get("fan_curve")
-
-        if not curve:
-            LOG.warning("No fan_curve for sensor '%s', skipping", sensor_id)
-            continue
-
-        # Critical override
-        if temp >= critical:
-            LOG.warning("CRITICAL: %s at %.1f°C (limit %d°C) → 100%%",
-                        sensor_id, temp, critical)
-            return 100.0
-
-        fan_pct = interpolate_fan(curve, temp, min_pct)
-        LOG.debug("  %s: %.1f°C → %.0f%%", sensor_id, temp, fan_pct)
-        if fan_pct > target:
-            target = fan_pct
-
-    # Apply proactive boost
-    if boost > 0:
-        target = min(target + boost, 100.0)
-        LOG.info("Boost +%.0f%% applied → %.0f%%", boost, target)
-
-    # Apply escalation override (temps still rising despite fan speed)
-    if escalation_pct > 0:
-        target = min(target + escalation_pct, 100.0)
-        LOG.warning("Escalation +%.0f%% → %.0f%%", escalation_pct, target)
-
-    # Apply cooling discount (active cooling detected = can run quieter)
-    if cooling_mode == "active":
-        discount = cfg.get("adaptive", {}).get("discount_percent", 5)
-        min_pct = cfg["min_fan_percent"]
-        old = target
-        target = max(target - discount, min_pct)
-        LOG.info("Active cooling: -%.0f%% (%.0f%% → %.0f%%)", discount, old, target)
-
-    return target
 
 # ---------------------------------------------------------------------------
 # Fan control via SSH to iLO
 # ---------------------------------------------------------------------------
 
-
 class IloSshSession:
-    """Persistent SSH connection to iLO4.
-
-    Keeps a single SSH session open and sends fan commands via stdin.
-    Reconnects automatically if the session dies or becomes unresponsive.
-    Uses select() to detect stale connections that appear alive but don't
-    respond — the root cause of the fan controller hanging silently.
-    """
+    """Persistent SSH connection to iLO4."""
 
     def __init__(self, cfg: dict):
         self._cfg = cfg
         self._proc = None
         self._consecutive_failures = 0
         self._max_failures = 3
-        self._send_timeout = 10  # seconds to wait for pipe write
+        self._send_timeout = 10
 
     def _build_ssh_cmd(self) -> list[str]:
         ilo = self._cfg["ilo"]
@@ -440,7 +431,6 @@ class IloSshSession:
         return self._proc is not None and self._proc.poll() is None
 
     def _drain_stdout(self):
-        """Non-blocking drain of stdout to prevent pipe buffer filling up."""
         if self._proc and self._proc.stdout:
             import select
             while select.select([self._proc.stdout], [], [], 0)[0]:
@@ -450,7 +440,6 @@ class IloSshSession:
                     break
 
     def connect(self) -> bool:
-        """Open persistent SSH session to iLO."""
         if self._is_alive():
             return True
         self.close()
@@ -481,20 +470,14 @@ class IloSshSession:
             return False
 
     def send_commands(self, commands: list[str]) -> bool:
-        """Send commands to the persistent SSH session with timeout protection."""
         if not self._is_alive():
             if not self.connect():
                 self._consecutive_failures += 1
                 return False
-
-        # Drain any buffered stdout to prevent pipe deadlock
         self._drain_stdout()
-
         try:
-            data = "\n".join(commands) + "\n"
-
-            # Use a thread to detect blocking writes
             import threading
+            data = "\n".join(commands) + "\n"
             write_ok = threading.Event()
             write_err = [None]
 
@@ -512,17 +495,13 @@ class IloSshSession:
             t.join(timeout=self._send_timeout)
 
             if not write_ok.is_set():
-                # Write timed out — session is stuck
-                LOG.error("SSH write timed out after %ds — session stuck, forcing reconnect",
-                          self._send_timeout)
+                LOG.error("SSH write timed out after %ds — reconnecting", self._send_timeout)
                 self._force_kill()
                 self._consecutive_failures += 1
                 return False
-
             if write_err[0] is not None:
                 raise write_err[0]
 
-            # Brief pause then check if session survived
             time.sleep(0.3)
             if not self._is_alive():
                 LOG.warning("SSH session died after sending commands")
@@ -532,7 +511,6 @@ class IloSshSession:
 
             self._consecutive_failures = 0
             return True
-
         except (BrokenPipeError, OSError) as e:
             LOG.warning("SSH pipe broken (%s), reconnecting next cycle", e)
             self.close()
@@ -540,7 +518,6 @@ class IloSshSession:
             return False
 
     def _force_kill(self):
-        """Force-kill a stuck SSH session."""
         if self._proc is not None:
             pid = self._proc.pid
             try:
@@ -554,11 +531,9 @@ class IloSshSession:
 
     @property
     def healthy(self) -> bool:
-        """Check if session is in a good state."""
         return self._consecutive_failures < self._max_failures
 
     def close(self):
-        """Close the SSH session gracefully."""
         if self._proc is not None:
             pid = self._proc.pid
             try:
@@ -581,13 +556,9 @@ class IloSshSession:
             LOG.info("SSH session closed (PID %d)", pid)
 
 
-def set_fans_ssh(cfg: dict, fan_percent: float, fan_count: int = 8, dry_run: bool = False,
-                ssh_session: IloSshSession = None) -> bool:
-    """Set fan speeds via SSH to iLO4.
-
-    iLO SSH is an interactive CLI, not a shell. Commands must be sent
-    via stdin, one per line, followed by 'exit'.
-    """
+def set_fans_ssh(cfg: dict, fan_percent: float, fan_count: int = 8,
+                 dry_run: bool = False, ssh_session: IloSshSession = None) -> bool:
+    """Set all fans to the same global speed via SSH to iLO4."""
     ilo = cfg["ilo"]
     speed_raw = int(round((fan_percent / 100.0) * 255))
     speed_raw = max(0, min(255, speed_raw))
@@ -597,22 +568,20 @@ def set_fans_ssh(cfg: dict, fan_percent: float, fan_count: int = 8, dry_run: boo
         commands.append(f"fan p {i} lock {speed_raw}")
 
     if dry_run:
-        LOG.info("[DRY-RUN] Would SSH to %s and run:", ilo["host"])
-        for cmd in commands:
-            LOG.info("[DRY-RUN]   %s", cmd)
-        LOG.info("[DRY-RUN] Fan speed: %d%% (raw: %d/255)", fan_percent, speed_raw)
+        LOG.info("[DRY-RUN] Would set all %d fans to %d%% (raw: %d/255)",
+                 fan_count, fan_percent, speed_raw)
         return True
 
-    # Use persistent session if available, fall back to one-shot
     if ssh_session is not None:
         ok = ssh_session.send_commands(commands)
         if ok:
-            LOG.info("Fans set to %d%% (raw %d/255) via persistent SSH", fan_percent, speed_raw)
+            LOG.info("All %d fans → %d%% (raw %d/255) [global]",
+                     fan_count, fan_percent, speed_raw)
         else:
             LOG.error("Failed to set fans via persistent SSH")
         return ok
 
-    # Fallback: one-shot SSH (for --once mode or when no session provided)
+    # Fallback: one-shot SSH
     ssh_cmd = [
         "sshpass", "-p", ilo["password"],
         "ssh", "-o", "StrictHostKeyChecking=no",
@@ -627,8 +596,7 @@ def set_fans_ssh(cfg: dict, fan_percent: float, fan_count: int = 8, dry_run: boo
     try:
         result = subprocess.run(
             ["timeout", "20"] + ssh_cmd,
-            input=stdin_data,
-            capture_output=True, text=True, timeout=25
+            input=stdin_data, capture_output=True, text=True, timeout=25
         )
         output = result.stdout + result.stderr
         if "Permission denied" in output:
@@ -637,14 +605,16 @@ def set_fans_ssh(cfg: dict, fan_percent: float, fan_count: int = 8, dry_run: boo
         if "Connection refused" in output or "No route" in output:
             LOG.error("SSH connection failed: %s", result.stderr.strip())
             return False
-        LOG.info("Fans set to %d%% (raw %d/255)", fan_percent, speed_raw)
+        LOG.info("All %d fans → %d%% (raw %d/255) [global]",
+                 fan_count, fan_percent, speed_raw)
         return True
     except subprocess.TimeoutExpired:
-        LOG.error("SSH to iLO timed out completely")
+        LOG.error("SSH to iLO timed out")
         return False
     except Exception as e:
         LOG.error("SSH fan set error: %s", e)
         return False
+
 
 # ---------------------------------------------------------------------------
 # Main loop
@@ -676,6 +646,10 @@ def run_once(cfg: dict, dry_run: bool = False, state: dict = None,
     if state is None:
         state = {"failures": 0, "last_pct": None}
 
+    ramp_cfg = cfg.get("ramp", {})
+    ramp_up = ramp_cfg.get("up_per_cycle", 3)
+    ramp_down = ramp_cfg.get("down_per_cycle", 1)
+
     temps = read_all_temps(cfg)
 
     if not temps:
@@ -691,51 +665,56 @@ def run_once(cfg: dict, dry_run: bool = False, state: dict = None,
 
     state["failures"] = 0
 
-    # Outdoor temp + adaptive cooling
     outdoor_temp = outdoor.get() if outdoor else None
     inlet_temp = temps.get("inlet")
     if cooling:
         cooling.record(inlet_temp, outdoor_temp)
-
-    # Track escalation
     if escalation:
         escalation.record(temps)
 
-    boost = compute_boost(cfg, temps, outdoor_temp)
+    cooling_mode = cooling.cooling_mode if cooling else "unknown"
+    esc_pct = escalation.escalation_pct if escalation else 0.0
 
-    # Log temps
+    # Compute raw global target (max-wins across all sensor curves + outdoor curve)
+    raw_target = compute_target_fan(
+        cfg, temps,
+        outdoor_temp=outdoor_temp,
+        cooling_mode=cooling_mode,
+        escalation_pct=esc_pct,
+    )
+
+    # Apply ramp-rate limiter — smooth transitions
+    ramped_target = apply_ramp(state["last_pct"], raw_target, ramp_up, ramp_down)
+    ramped_target = round(ramped_target, 1)
+
+    # Log
     temp_str = " | ".join(f"{k}: {v:.0f}°C" for k, v in sorted(temps.items()))
     extra = ""
     if outdoor_temp is not None:
         extra += f" | outdoor: {outdoor_temp:.0f}°C"
-    if cooling and cooling.cooling_mode != "unknown":
-        extra += f" | cooling: {cooling.cooling_mode}"
-    if escalation and escalation.escalation_pct > 0:
-        extra += f" | ESCALATION: +{escalation.escalation_pct:.0f}%"
-    LOG.debug("Temps: %s%s", temp_str, extra)
+    if cooling_mode != "unknown":
+        extra += f" | cooling: {cooling_mode}"
+    if esc_pct > 0:
+        extra += f" | ESCALATION: +{esc_pct:.0f}%"
+    if ramped_target != raw_target:
+        extra += f" | ramp: {raw_target:.0f}% → {ramped_target:.0f}%"
 
-    cooling_mode = cooling.cooling_mode if cooling else "unknown"
-    esc_pct = escalation.escalation_pct if escalation else 0.0
-    target = compute_target_fan(cfg, temps, boost=boost,
-                                cooling_mode=cooling_mode,
-                                escalation_pct=esc_pct)
-    target = round(target, 1)
-
-    # Only update if changed by >= 1%
-    if state["last_pct"] is not None and abs(target - state["last_pct"]) < 1.0:
-        LOG.debug("Fan unchanged at %.0f%%", state["last_pct"])
+    # Only send command if changed by >= 1%
+    if state["last_pct"] is not None and abs(ramped_target - state["last_pct"]) < 1.0:
+        LOG.debug("Fans unchanged at %.0f%%", state["last_pct"])
         return state
 
-    LOG.info("Temps: %s%s → Fan: %.0f%%", temp_str, extra, target)
-    set_fans_ssh(cfg, target, dry_run=dry_run, ssh_session=ssh_session)
-    state["last_pct"] = target
+    LOG.info("Temps: %s%s → Global fans: %.0f%%", temp_str, extra, ramped_target)
+    set_fans_ssh(cfg, ramped_target, dry_run=dry_run, ssh_session=ssh_session)
+    state["last_pct"] = ramped_target
     return state
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Thermal fan controller for HP DL360p Gen8")
-    parser.add_argument("-c", "--config", default="/etc/fan-controller/config.yaml",
-                        help="Config file path")
+    parser = argparse.ArgumentParser(
+        description="Thermal fan controller for HP DL360p Gen8 — global smooth mode"
+    )
+    parser.add_argument("-c", "--config", default="/etc/fan-controller/config.yaml")
     parser.add_argument("--dry-run", action="store_true",
                         help="Read temps but don't set fans")
     parser.add_argument("--once", action="store_true",
@@ -745,10 +724,11 @@ def main():
     cfg = load_config(args.config)
     setup_logging(cfg)
 
-    LOG.info("Fan controller starting (interval=%ds, min=%d%%, dry_run=%s)",
+    LOG.info("Fan controller starting (interval=%ds, min=%d%%, dry_run=%s, mode=global-max-wins)",
              cfg["interval"], cfg["min_fan_percent"], args.dry_run)
 
     running = True
+
     def handle_signal(sig, frame):
         nonlocal running
         LOG.info("Shutting down (signal %d)", sig)
@@ -767,7 +747,6 @@ def main():
                  outdoor=outdoor, cooling=cooling, escalation=escalation)
         return
 
-    # Persistent SSH session — one connection, reused across cycles
     ssh_session = IloSshSession(cfg) if not args.dry_run else None
 
     try:
